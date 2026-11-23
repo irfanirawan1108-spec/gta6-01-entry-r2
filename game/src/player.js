@@ -1,393 +1,170 @@
-// The player on foot: walking, running, punching, shooting, stealing
-// cars, and interacting with shops and pickups. Driving lives in
-// vehicles.js; the player object is the shared state both use.
+// The player: on foot (walk, run, punch, shoot) and driving (arcade
+// handling, handbrake, ramps, crashes). Stealing a car in front of a
+// witness draws police heat.
+import { G, clamp, floatText, say } from './state.js';
+import { CITY, collide, onRoad } from './city.js';
+import { nearestCar, damageCar } from './vehicles.js';
+import { hurtPed } from './pedestrians.js';
+import { addHeat } from './police.js';
+import { held, pressed, mouse } from './input.js';
+import { spawn, smoke } from './particles.js';
+import { interact } from './missions.js';
+import { sfx } from './audio.js';
 
-import { PLAYER, ECONOMY } from './config.js';
-import { CITY_W, CITY_H, hitsBuilding, isWater } from './city.js';
-import { clamp, dist, angleTo, turnToward } from './random.js';
-import { spawn, addFloat } from './particles.js';
-import { scarePeds } from './pedestrians.js';
-import { carSize, explodeCar } from './vehicles.js';
+const FOOT = 150, RUN = 235;
 
-export function makePlayer(x, y) {
-  return {
-    x, y,
-    angle: -Math.PI / 2,
-    speed: 0,
-    health: PLAYER.maxHealth,
-    armor: 0,
-    cash: ECONOMY.startCash,
-    car: null, // car object when driving
-    weapon: 'fists', // fists | pistol
-    ammo: 0,
-    punchTimer: 0,
-    gunTimer: 0,
-    hurtTimer: 0,
-    aimAngle: 0,
-    walkPhase: 0,
-    moving: false,
-  };
+function witnessNear(x, y) {
+  for (const p of G.peds) if (!p.dead && Math.hypot(p.x - x, p.y - y) < 130) return true;
+  for (const c of G.cops) if (Math.hypot(c.x - x, c.y - y) < 220) return true;
+  return false;
 }
-
-export function hurtPlayer(G, dmg, fromX, fromY) {
-  const p = G.player;
-  if (p.hurtTimer > 0 || G.mode === 'busted' || G.mode === 'wasted') return;
-  p.hurtTimer = 0.5;
-  let rest = dmg;
-  if (p.armor > 0) {
-    const absorbed = Math.min(p.armor, rest);
-    p.armor -= absorbed;
-    rest -= absorbed;
+function tryEnterCar() {
+  const c = nearestCar(G.x, G.y, 36);
+  if (!c || c.hp <= 0) return false;
+  if (c.driver === 'traffic') {
+    if (witnessNear(c.x, c.y)) { addHeat(18); say('Car stolen — witness called it in!'); }
+    c.route = null;
   }
-  p.health -= rest;
-  spawn(G.particles, 'spark', p.x, p.y, { n: 6, speed: 140, life: 0.4, size: 3, color: '#ff5a5a' });
-  if (fromX !== undefined) {
-    const a = angleTo(fromX, fromY, p.x, p.y);
-    p.x += Math.cos(a) * 14;
-    p.y += Math.sin(a) * 14;
-  }
-  if (p.health <= 0) {
-    p.health = 0;
-    G.mode = 'wasted';
-    G.modeTimer = 0;
-    G.audio.sfx('fail');
-  }
+  c.driver = 'player';
+  G.car = c; G.onFoot = false; G.speed = 0;
+  return true;
 }
-
-export function updatePlayerOnFoot(G, input, dt) {
-  const p = G.player;
-  p.punchTimer = Math.max(0, p.punchTimer - dt);
-  p.gunTimer = Math.max(0, p.gunTimer - dt);
-  p.hurtTimer = Math.max(0, p.hurtTimer - dt);
-
-  const ax = input.axis();
-  const running = input.isDown('run');
-  const speed = running ? PLAYER.runSpeed : PLAYER.walkSpeed;
-  const mx = ax.x;
-  const my = ax.y;
-  p.moving = mx !== 0 || my !== 0;
-  if (p.moving) {
-    const len = Math.hypot(mx, my) || 1;
-    const tx = mx / len;
-    const ty = my / len;
-    p.angle = turnToward(p.angle, Math.atan2(ty, tx), 12 * dt);
-    let nx = p.x + tx * speed * dt;
-    let ny = p.y + ty * speed * dt;
-    // Building collision: slide.
-    if (hitsBuilding(G.city, nx, ny, PLAYER.radius)) {
-      if (!hitsBuilding(G.city, nx, p.y, PLAYER.radius)) ny = p.y;
-      else if (!hitsBuilding(G.city, p.x, ny, PLAYER.radius)) nx = p.x;
-      else {
-        nx = p.x;
-        ny = p.y;
-      }
-    }
-    // Ocean edge and world bounds.
-    nx = clamp(nx, 16, 5560);
-    ny = clamp(ny, 16, 3580);
-    if (isWater(nx, ny)) {
-      nx = p.x;
-      ny = p.y;
-    }
-    p.x = nx;
-    p.y = ny;
-    p.walkPhase += dt * speed / 12;
-    // Footstep dust on sand.
-    if (Math.random() < dt * 6) {
-      spawn(G.particles, 'smoke', p.x, p.y + 10, { n: 1, speed: 12, life: 0.4, size: 3, color: '#c9b896' });
-    }
-  }
-
-  // Aim: face the mouse when the gun is out, else face movement.
-  if (p.weapon === 'pistol') {
-    const wx = G.camera.x + (input.mouse.x - G.view.w / 2) / G.camera.zoom;
-    const wy = G.camera.y + (input.mouse.y - G.view.h / 2) / G.camera.zoom;
-    p.aimAngle = angleTo(p.x, p.y, wx, wy);
-    p.angle = p.aimAngle;
-  }
-
-  // Attack.
-  if (input.wasPressed('attack') || (input.mouse.clicked && p.weapon === 'pistol')) {
-    if (p.weapon === 'fists' && p.punchTimer <= 0) {
-      p.punchTimer = PLAYER.punchCooldown;
-      G.audio.sfx('punch');
-      punch(G);
-    } else if (p.weapon === 'pistol' && p.gunTimer <= 0 && p.ammo > 0) {
-      p.gunTimer = PLAYER.gunCooldown;
-      p.ammo--;
-      shoot(G);
-    } else if (p.weapon === 'pistol' && p.ammo <= 0) {
-      G.ui.message('Out of ammo — buy more at Ammu-Nation.', '#e8c95a', 2.5);
-      p.weapon = 'fists';
-    }
-  }
-
-  // Enter the nearest car.
-  if (input.wasPressed('enter')) {
-    tryEnterCar(G);
-  }
-
-  // Pick up hidden packages.
-  for (const pkg of G.packages) {
-    if (!pkg.taken && dist(p.x, p.y, pkg.x, pkg.y) < 30) {
-      pkg.taken = true;
-      p.cash += ECONOMY.packageReward;
-      G.flags.packages = (G.flags.packages || 0) + 1;
-      G.audio.sfx('cash');
-      addFloat(G.particles, pkg.x, pkg.y - 20, '+' + ECONOMY.packageReward + '  Hidden package!', '#ffd94a');
-      G.ui.message(`Hidden package ${G.flags.packages}/${ECONOMY.packageCount} — +$${ECONOMY.packageReward}`, '#ffd94a', 2.5);
-      if (G.flags.packages >= ECONOMY.packageCount) {
-        p.cash += 1000;
-        G.ui.message('ALL PACKAGES FOUND! Bonus $1,000!', '#ffd94a', 4);
-      }
-    }
-  }
+function exitCar() {
+  const c = G.car;
+  c.driver = 'none'; c.sp = 0;
+  G.car = null; G.onFoot = true;
+  G.x = c.x - Math.sin(c.a) * 26; G.y = c.y + Math.cos(c.a) * 26;
+  const p = collide(G.x, G.y, 8);
+  G.x = p[0]; G.y = p[1];
+  G.a = c.a;
 }
-
-function punch(G) {
-  const p = G.player;
-  const px = p.x + Math.cos(p.angle) * 26;
-  const py = p.y + Math.sin(p.angle) * 26;
-  spawn(G.particles, 'spark', px, py, { n: 5, speed: 120, life: 0.3, size: 3, color: '#ffffff' });
-  // Hit a ped.
-  for (const ped of G.peds) {
-    if (ped.state === 'down') continue;
-    if (dist(px, py, ped.x, ped.y) < 34) {
-      ped.state = 'down';
-      scarePeds(G, ped.x, ped.y, 260);
-      G.wanted = Math.min(5, G.wanted + 1);
-      G.heat = Math.min(100, G.heat + 25);
-      return;
-    }
+function punch() {
+  const fx = G.x + Math.cos(G.a) * 24, fy = G.y + Math.sin(G.a) * 24;
+  let best = null, bd = 34;
+  for (const p of G.peds) {
+    if (p.dead) continue;
+    const d = Math.hypot(p.x - fx, p.y - fy);
+    if (d < bd) { bd = d; best = p; }
   }
-  // Hit a cop on foot.
-  for (const cop of G.cops) {
-    if (cop.onFoot && dist(px, py, cop.x, cop.y) < 34) {
-      cop.hp -= PLAYER.punchDamage;
-      if (cop.hp <= 0) {
-        cop.down = true;
-        cop.downTimer = 6;
-        G.wanted = Math.min(5, G.wanted + 1);
-        G.heat = 100;
-      }
-      return;
-    }
-  }
-  // Smash a car window: damage a parked car.
-  for (const car of G.cars) {
-    if (dist(px, py, car.x, car.y) < 40) {
-      car.hp -= PLAYER.punchDamage;
-      spawn(G.particles, 'spark', car.x, car.y, { n: 4, speed: 150, life: 0.3, size: 2, color: '#bfeef2' });
-      return;
-    }
-  }
+  if (best) { hurtPed(best, 14, true); sfx('punch'); return; }
+  const c = nearestCar(fx, fy, 30);
+  if (c) { damageCar(c, 5, true); addHeat(4); spawn(c.x, c.y, 4, '#ffd60a', 50, 0.3, 2); sfx('punch'); }
 }
-
-function shoot(G) {
-  const p = G.player;
-  G.audio.sfx('gun');
-  const a = p.aimAngle;
-  const mx = p.x + Math.cos(a) * 22;
-  const my = p.y + Math.sin(a) * 22;
-  spawn(G.particles, 'spark', mx, my, { n: 4, speed: 260, life: 0.15, size: 3, color: '#ffe95a' });
-  // Trace the bullet: first ped / cop / car within range along the ray.
-  let bestD = PLAYER.gunRange;
-  let hit = null;
-  let hitKind = null;
-  const step = 14;
-  for (let d = 20; d < PLAYER.gunRange; d += step) {
-    const x = p.x + Math.cos(a) * d;
-    const y = p.y + Math.sin(a) * d;
-    if (hitsBuilding(G.city, x, y, 2)) {
-      bestD = d;
-      spawn(G.particles, 'spark', x, y, { n: 3, speed: 120, life: 0.25, size: 2, color: '#cccccc' });
-      break;
-    }
-    for (const ped of G.peds) {
-      if (ped.state !== 'down' && dist(x, y, ped.x, ped.y) < 16) {
-        hit = ped;
-        hitKind = 'ped';
-        bestD = d;
+function shoot() {
+  if (!G.hasPistol || G.ammo <= 0 || G.weapon !== 1) return;
+  G.ammo--;
+  const wx = G.cam.x + mouse.x, wy = G.cam.y + mouse.y;
+  const a = Math.atan2(wy - G.y, wx - G.x);
+  G.a = a;
+  spawn(G.x + Math.cos(a) * 20, G.y + Math.sin(a) * 20, 3, '#ffd60a', 80, 0.15, 2);
+  // first ped or car within 14px of the shot line, up to 420px out
+  let best = null, bd = 420, kind = '';
+  for (const p of G.peds) {
+    if (p.dead) continue;
+    const dx = p.x - G.x, dy = p.y - G.y, along = dx * Math.cos(a) + dy * Math.sin(a);
+    if (along < 0 || along > bd) continue;
+    const side = Math.abs(-dx * Math.sin(a) + dy * Math.cos(a));
+    if (side < 16) { bd = along; best = p; kind = 'ped'; }
+  }
+  for (const c of G.cars) {
+    if (c === G.car) continue;
+    const dx = c.x - G.x, dy = c.y - G.y, along = dx * Math.cos(a) + dy * Math.sin(a);
+    if (along < 0 || along > bd) continue;
+    const side = Math.abs(-dx * Math.sin(a) + dy * Math.cos(a));
+    if (side < 18) { bd = along; best = c; kind = 'car'; }
+  }
+  if (best) {
+    if (kind === 'ped') hurtPed(best, 34, true); else damageCar(best, 22, true);
+    spawn(best.x, best.y, 6, '#c0392b', 70, 0.4, 3);
+  }
+  addHeat(8); sfx('shot');
+}
+function drive(dt) {
+  const c = G.car;
+  const wrecked = c.hp <= 0;
+  if (wrecked && !c.wreckToast) { c.wreckToast = true; say('Your car is wrecked — press E to get out'); }
+  const fwd = wrecked ? 0 : held('KeyW', 'ArrowUp') ? 1 : held('KeyS', 'ArrowDown') ? -1 : 0;
+  const steer = (held('KeyA', 'ArrowLeft') ? -1 : 0) + (held('KeyD', 'ArrowRight') ? 1 : 0);
+  const brake = held('Space');
+  const offroad = !onRoad(c.x, c.y);
+  const top = c.max * (offroad ? 0.55 : 1);
+  if (fwd > 0) c.sp += c.acc * dt;
+  else if (fwd < 0) c.sp -= (c.sp > 0 ? c.acc * 1.4 : c.acc * 0.7) * dt;
+  else c.sp *= Math.pow(0.4, dt);
+  if (brake) c.sp *= Math.pow(0.05, dt);
+  c.sp = clamp(c.sp, -c.max * 0.35, top);
+  const dir = c.sp >= 0 ? 1 : -1;
+  c.a += steer * c.turn * dt * dir * clamp(Math.abs(c.sp) / 90, 0, 1);
+  const nx = c.x + Math.cos(c.a) * c.sp * dt, ny = c.y + Math.sin(c.a) * c.sp * dt;
+  const before = Math.abs(c.sp);
+  const p = collide(nx, ny, 14);
+  if ((p[0] !== nx || p[1] !== ny) && before > 280) {
+    damageCar(c, (before - 280) / 22, false);
+    G.health -= (before - 280) / 40;
+    spawn(c.x, c.y, 10, '#ffd60a', 90, 0.5, 3);
+    sfx('crash');
+    c.sp *= 0.3;
+  }
+  c.x = p[0]; c.y = p[1];
+  G.x = c.x; G.y = c.y; G.a = c.a; G.speed = c.sp;
+  // stunt ramps: cross one fast and you fly
+  if (G.airT <= 0) {
+    for (const r of CITY.ramps) {
+      if (Math.hypot(c.x - r.x, c.y - r.y) < 26 && Math.abs(c.sp) > 200) {
+        G.airT = 0.55 + Math.abs(c.sp) / 900;
+        G.jumpT = G.airT;
+        sfx('jump');
         break;
       }
     }
-    if (hit) break;
-    for (const cop of G.cops) {
-      if (cop.onFoot && !cop.down && dist(x, y, cop.x, cop.y) < 16) {
-        hit = cop;
-        hitKind = 'cop';
-        bestD = d;
-        break;
-      }
+  } else {
+    G.airT -= dt;
+    if (G.airT <= 0) {
+      const bonus = 25 + Math.floor((G.jumpT || 0.6) * 40);
+      G.cash += bonus; G.stats.jumps++; G.stats.earned += bonus;
+      floatText(c.x, c.y - 20, 'STUNT +$' + bonus, '#ffd60a');
+      sfx('pickup');
     }
-    if (hit) break;
-    for (const car of G.cars) {
-      const { len, wid } = carSize(car);
-      const dx = x - car.x;
-      const dy = y - car.y;
-      const along = Math.abs(dx * Math.cos(car.angle) + dy * Math.sin(car.angle));
-      const side = Math.abs(-dx * Math.sin(car.angle) + dy * Math.cos(car.angle));
-      if (along < len / 2 && side < wid / 2) {
-        hit = car;
-        hitKind = 'car';
-        bestD = d;
-        break;
-      }
-    }
-    if (hit) break;
   }
-  // Draw a tracer.
-  G.tracer = { x1: mx, y1: my, x2: p.x + Math.cos(a) * bestD, y2: p.y + Math.sin(a) * bestD, life: 0.09 };
-  if (hitKind === 'ped') {
-    hit.state = 'down';
-    scarePeds(G, hit.x, hit.y, 320);
-    G.wanted = Math.min(5, G.wanted + 1);
-    G.heat = Math.min(100, G.heat + 30);
-  } else if (hitKind === 'cop') {
-    hit.hp -= PLAYER.gunDamage;
-    if (hit.hp <= 0) {
-      hit.down = true;
-      hit.downTimer = 6;
-      G.wanted = Math.min(5, G.wanted + 1);
-      G.heat = 100;
-    }
-  } else if (hitKind === 'car') {
-    hit.hp -= PLAYER.gunDamage;
-    spawn(G.particles, 'smoke', hit.x, hit.y, { n: 4, speed: 60, life: 0.8, size: 6, color: '#555' });
-    if (hit.driver === 'police') {
-      G.wanted = Math.min(5, G.wanted + 1);
-      G.heat = 100;
-    }
-    if (hit.hp <= 0) explodeCar(G, hit);
-  }
-  // A gunshot is loud: witnesses raise the heat.
-  G.heat = Math.min(100, G.heat + 12);
-  scarePeds(G, p.x, p.y, 420);
+  if (c.hp < 40 && Math.random() < dt * 3) smoke(c.x, c.y);
 }
-
-function tryEnterCar(G) {
-  const p = G.player;
-  let best = null;
-  let bestD = 62;
-  for (const car of G.cars) {
-    if (car.driver === 'police') continue;
-    const d = dist(p.x, p.y, car.x, car.y);
-    if (d < bestD) {
-      bestD = d;
-      best = car;
-    }
-  }
-  if (!best) return;
-  // Stealing in front of a witness raises the wanted level.
-  const witnessed = G.peds.some((ped) => ped.state !== 'down' && dist(ped.x, ped.y, p.x, p.y) < 380);
-  const wasParked = best.driver === 'parked';
-  best.driver = 'player';
-  best.speed = 0;
-  p.car = best;
-  G.audio.sfx('door');
-  if (wasParked && witnessed) {
-    G.wanted = Math.max(G.wanted, 1);
-    G.heat = Math.min(100, G.heat + 30);
-    G.ui.message('Car stolen — a witness called the cops!', '#ff5a5a', 2.5);
-  } else if (wasParked) {
-    G.ui.message(`You took the ${best.label}.`, '#ffffff', 1.6);
-  }
+function walk(dt) {
+  let dx = 0, dy = 0;
+  if (held('KeyW', 'ArrowUp')) dy -= 1;
+  if (held('KeyS', 'ArrowDown')) dy += 1;
+  if (held('KeyA', 'ArrowLeft')) dx -= 1;
+  if (held('KeyD', 'ArrowRight')) dx += 1;
+  const run = held('ShiftLeft', 'ShiftRight');
+  const sp = run ? RUN : FOOT;
+  if (dx || dy) {
+    const len = Math.hypot(dx, dy);
+    dx /= len; dy /= len;
+    G.a = Math.atan2(dy, dx);
+    const p = collide(G.x + dx * sp * dt, G.y + dy * sp * dt, 8);
+    G.x = p[0]; G.y = p[1];
+    G.speed = sp;
+  } else G.speed = 0;
+  if (pressed('Space')) punch();
+  if (mouse.clicked) shoot();
+  if (pressed('Digit1')) G.weapon = 0;
+  if (pressed('Digit2') && G.hasPistol) G.weapon = 1;
 }
-
-export function exitCar(G) {
-  const p = G.player;
-  const car = p.car;
-  if (!car) return;
-  car.driver = 'parked';
-  car.speed = 0;
-  // Step out to the side.
-  const side = Math.random() < 0.5 ? 1 : -1;
-  p.x = car.x + Math.cos(car.angle + Math.PI / 2) * side * 26;
-  p.y = car.y + Math.sin(car.angle + Math.PI / 2) * side * 26;
-  p.angle = car.angle;
-  p.car = null;
-  G.audio.sfx('door');
-}
-
-// Buying at a shop: called from the HUD prompt when the player is near.
-export function shopAction(G, kind) {
-  const p = G.player;
-  if (kind === 'gun') {
-    if (p.weapon !== 'pistol') {
-      if (p.cash < ECONOMY.gunPrice) {
-        G.ui.message('Not enough cash for a pistol ($300).', '#ff5a5a', 2);
-        return;
-      }
-      p.cash -= ECONOMY.gunPrice;
-      p.weapon = 'pistol';
-      p.ammo = ECONOMY.ammoPack;
-      G.ui.message('Pistol bought! Press 1 for fists, 2 for pistol.', '#ffd94a', 2.5);
-      G.audio.sfx('cash');
-      return;
-    }
-    if (p.ammo < ECONOMY.ammoPack * 2) {
-      if (p.cash < ECONOMY.ammoPrice) {
-        G.ui.message('Not enough cash for ammo ($60).', '#ff5a5a', 2);
-        return;
-      }
-      p.cash -= ECONOMY.ammoPrice;
-      p.ammo += ECONOMY.ammoPack;
-      G.ui.message(`+${ECONOMY.ammoPack} ammo.`, '#ffd94a', 1.5);
-      G.audio.sfx('cash');
-      return;
-    }
-    if (p.armor < 100) {
-      if (p.cash < ECONOMY.armorPrice) {
-        G.ui.message('Not enough cash for armor ($250).', '#ff5a5a', 2);
-        return;
-      }
-      p.cash -= ECONOMY.armorPrice;
-      p.armor = 100;
-      G.ui.message('Body armor fitted.', '#ffd94a', 1.5);
-      G.audio.sfx('cash');
-      return;
-    }
-    G.ui.message('Ammo and armor are full.', '#e8c95a', 1.5);
-  } else if (kind === 'armor') {
-    if (p.armor >= 100) {
-      G.ui.message('Armor is full.', '#e8c95a', 1.5);
-      return;
-    }
-    if (p.cash < ECONOMY.armorPrice) {
-      G.ui.message('Not enough cash for armor ($250).', '#ff5a5a', 2);
-      return;
-    }
-    p.cash -= ECONOMY.armorPrice;
-    p.armor = 100;
-    G.ui.message('Body armor fitted.', '#ffd94a', 1.5);
-    G.audio.sfx('cash');
-  } else if (kind === 'heal') {
-    if (p.health >= 100) {
-      G.ui.message('Health is full.', '#e8c95a', 1.5);
-      return;
-    }
-    if (p.cash < ECONOMY.healPrice) {
-      G.ui.message('Not enough cash for treatment ($80).', '#ff5a5a', 2);
-      return;
-    }
-    p.cash -= ECONOMY.healPrice;
-    p.health = 100;
-    G.ui.message('Patched up. Health restored.', '#7ddc8a', 1.5);
-    G.audio.sfx('pickup');
-  } else if (kind === 'spray') {
-    if (G.wanted === 0) {
-      G.ui.message('No heat to lose.', '#e8c95a', 1.5);
-      return;
-    }
-    if (p.cash < ECONOMY.sprayPrice) {
-      G.ui.message('Not enough cash for a respray ($100).', '#ff5a5a', 2);
-      return;
-    }
-    p.cash -= ECONOMY.sprayPrice;
-    G.wanted = 0;
-    G.heat = 0;
-    if (p.car) p.car.color = '#3a6fb8';
-    G.ui.message('Fresh paint — the heat is off.', '#7ddc8a', 2);
-    G.audio.sfx('cash');
+export function updatePlayer(dt) {
+  if (pressed('KeyE')) {
+    if (G.onFoot) {
+      if (!tryEnterCar()) interact();
+    } else exitCar();
   }
+  if (G.onFoot) walk(dt);
+  else drive(dt);
+  // hidden packages
+  for (const p of G.packages) {
+    if (!p.taken && Math.hypot(p.x - G.x, p.y - G.y) < 24) {
+      p.taken = true; G.cash += 25; G.stats.pkgs++; G.stats.earned += 25;
+      floatText(p.x, p.y - 10, 'PACKAGE +$25', '#58d68d');
+      say(`Hidden package ${G.stats.pkgs}/15 found (+$25)`);
+      sfx('pickup');
+    }
+  }
+  if (G.health <= 0) G.health = 0;
 }
